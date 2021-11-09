@@ -1,0 +1,368 @@
+---
+title: "scRNAmp Analysis"
+author: "Matthew Zatzman"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    number_sections: yes
+    toc_depth: 2
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(ggsci)
+library(ggpubr)
+library(ggalluvial)
+library(Seurat)
+library(ggthemes)
+library(patchwork)
+theme_set(theme_bw(base_size = 16) + theme(aspect.ratio = 1))
+```
+
+# scRNAmp analysis
+
+Here we are reanalyzing data from *D. Lambrechts, ... B. Thienpont, Phenotype molding of stromal cells in the lung tumor microenvironment. Nat. Med. 24, 1277–1289 (2018).* In this study, five lung cancer patients had single-cell RNA-sequenced performed on three separate regions of their tumors. The objective is to first look at differences in tumor and normal cell RNA output in single cells, and secondly to explore intra-tumoral heterogeneity of hypertranscription in tumors.
+
+## RNAmp in single cells
+With the single cell data set we can first explore how RNA output shifts between tumor and normal cell populations, and compare it with our TCGA results.
+
+```{r load data}
+# Load the provided rds
+RawDataLung.table.rds <- readRDS("data/RawDataLung.table.rds")
+dim(RawDataLung.table.rds)
+```
+
+In 10X based scRNA-seq assays, UMIs provide a unique barcode for each transcript in each cell. For each individual sequencing run, the UMIs provide an quasi-absolute count of transcripts. We first take the sum of UMIs in each cell.
+```{r umi counts}
+# Get UMI counts per cell
+umis <- data.frame(Matrix::colSums(RawDataLung.table.rds))
+colnames(umis) <- "n_UMIs"
+umis$cell <- as.character(row.names(umis))
+rownames(umis) <- NULL
+head(umis)
+```
+Average UMIs per cell
+```{r, warning=FALSE, message=FALSE}
+ggdensity(data = umis, x = "n_UMIs", add = "median", xscale = "log10")
+```
+
+We load the provided metadata with cell annotation information
+```{r load metadata}
+# MetaData
+meta <- read.table("data/MetaData.txt", header = T, sep = "\t")
+meta$cell <- as.character(meta$cell)
+summary(as.factor(meta$CellType))
+```
+
+We merge the total UMI counts per cell and Z-scale normalize within each individual patient piece.
+```{r}
+meta <- merge(meta, umis, by = "cell")
+
+meta$piece_source <- gsub(pattern = "[0-9]_", replacement = "", x = meta$Patient_piece)
+
+meta$z_UMI_all <- ave(log10(meta$n_UMIs), meta$Patient_piece, FUN = scale)
+```
+
+In each tumor piece and cell group, we want to normalize each cell types RNA output to each other cell type within the tumor. We create a summary of the number of cells per group, and the total and mean UMI counts.
+
+```{r, warning=FALSE, message=FALSE}
+# Create piecewise summary
+piece.summary <- meta %>%
+  group_by(PatientNumber.MS, Patient_piece, piece_source) %>%
+  summarise(piece_cell_count = n(), piece_umis = sum(n_UMIs), sample_mean_umi = mean(n_UMIs))
+
+# Create cell type summary
+cell.type.summary <- filter(meta, CellFromTumor == T) %>%
+  group_by(PatientNumber.MS, Patient_piece, CellType) %>%
+  summarise(celltype_count = n(), celltype_umis = sum(n_UMIs), celltype_mean_umis = mean(n_UMIs))
+
+# And merge the two
+cell.type.summary <- merge(piece.summary, cell.type.summary, by = c("PatientNumber.MS", "Patient_piece"))
+```
+Then we calculate the proportion of each cell type within each 'piece' amd the proportion of UMIs. Also, for an RNAmp-like comparison, we measure the relative contribution of each cell type to the overall RNA output as a fold change.
+```{r}
+# Compute cell type proportions and umi proportions and mean umis per cell
+cell.type.summary <- cell.type.summary %>%
+  mutate(
+    cell_prop = celltype_count / piece_cell_count,
+    UMI_prop = celltype_umis / piece_umis
+  )
+# Nice labels
+cell.type.summary$prop.labs <- paste0(cell.type.summary$CellType, " (", (round(cell.type.summary$cell_prop, digits = 2) * 100), "%)")
+cell.type.summary$umi.labs <- paste0(cell.type.summary$CellType, " (", (round(cell.type.summary$UMI_prop, digits = 2) * 100), "%)")
+
+# Global amp -- take the average UMIs of the cell type vs the UMIs of all other cell types
+cell.type.summary$vs.others <- with(cell.type.summary, (celltype_umis / celltype_count) / ((piece_umis - celltype_umis) / (piece_cell_count - celltype_count)))
+
+# Within population shift (percentage -- we don't use this)
+cell.type.summary$prop_change <- with(cell.type.summary, UMI_prop / cell_prop)
+cell.type.summary$piece_source <- factor(cell.type.summary$piece_source, levels = c("core", "middle", "edge"))
+```
+
+And plot the result, showing that tumor cell's RNA output is significantly increased compared to each other cell type.
+```{r}
+# Consistent cell type colorings
+celltype_cols <- vector(length = length(unique(cell.type.summary$CellType)))
+gg_color_hue <- function(n) {
+  hues <- seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+celltype_cols <- gg_color_hue(length(unique(cell.type.summary$CellType)))
+names(celltype_cols) <- as.vector(unique(cell.type.summary$CellType))
+
+# Plot of amp value versus all other cells -- this is like a populatino level summary
+ggplot(cell.type.summary, aes(x = reorder(CellType, vs.others, median), y = vs.others)) +
+  geom_boxplot(aes(fill = CellType)) +
+  scale_y_continuous(trans = "log2", breaks = 2^(-5:5)) +
+  geom_hline(yintercept = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), legend.position = "none") +
+  labs(y = "Within sample UMI count\nvs all other cell types", x = "Cell Type") +
+  scale_fill_manual(values = celltype_cols) +
+  stat_compare_means(ref.group = "tumor", label = "p.signif", method = "t.test", method.args = list(pool.sd = T))
+```
+
+The TCGA average fold change in RNA output is almost identical to single-cell derived values
+```{r}
+# Load TCGA RNAmp data
+tcga.amp <- read.table(file = "data/Supplemental Table 2.txt", header = T, sep = "\t")
+# Do this but with TCGA data on the right
+tcga.lung.dat <- filter(tcga.amp, project_code %in% c("LUAD", "LUSC")) %>% dplyr::select(project_code, rna_output_fch, sample_name)
+
+tcga.lung.dat$CellType <- "TCGA_Lung"
+tcga.lung.dat$vs.others <- tcga.lung.dat$rna_output_fch
+
+celltype.tcga.df <- rbind(tcga.lung.dat[, c("CellType", "vs.others")], cell.type.summary[, c("CellType", "vs.others")])
+
+# Reorder by median, but TCGA tumors on the left
+celltype.tcga.df$CellType <- factor(celltype.tcga.df$CellType, levels = c("T_cell", "EC", "B_cell", "Fibro", "Alveolar", "Myeloid", "Epi", "tumor", "TCGA_Lung"), labels = c("T cell", "Endothelial", "B Cell", "Fibroblast", "Alveolar", "Myeloid", "Epithelial", "Tumor cell", "TCGA Lung"))
+
+ggplot(celltype.tcga.df, aes(x = CellType, y = vs.others)) +
+  geom_boxplot(aes(fill = CellType), outlier.size = 0.2) +
+  scale_y_continuous(trans = "log2", breaks = 2^(-3:4), labels = c("1/8", "1/4", "1/2", 1, 2, 4, 8, 16)) +
+  geom_hline(yintercept = 1) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.35, hjust = 1), legend.position = "none") +
+  labs(y = "Transcriptional output\n(Fold change)", x = "Cell Type") +
+  scale_fill_jco() +
+  stat_compare_means(ref.group = "Tumor cell", label = "p.signif", symnum.args = list(cutpoints = c(0, 0.001, 0.01, 0.05, 1), symbols = c("***", "**", "*", "ns")), method = "t.test", method.args = list(pool.sd = T), label.y.npc = 0.9)
+```
+
+```{r}
+celltype.tcga.df %>%
+  group_by(CellType) %>%
+  summarise(mean = mean(vs.others), median = median(vs.others))
+```
+Let's graph the individual tumor pieces from each patient to see the trend across all sequenced tumor pieces.
+```{r, fig.height=2, fig.width=6}
+cell.type.summary.melt <- reshape2::melt(cell.type.summary, id.vars = c("PatientNumber.MS", "Patient_piece", "piece_cell_count", "piece_umis", "piece_source", "sample_mean_umi", "CellType", "vs.others"), measure.vars = c("cell_prop", "UMI_prop"))
+
+cell.type.summary.melt$variable <- factor(cell.type.summary.melt$variable, labels = c("Cell proportion", "UMI proportion"))
+
+cell.type.summary.melt$patient <- with(cell.type.summary.melt, paste0("Patient ", PatientNumber.MS))
+cell.type.summary$patient <- with(cell.type.summary, paste0("Patient ", PatientNumber.MS))
+
+# Annotate  above with the fold change
+ggplot(filter(cell.type.summary.melt, CellType == "tumor"), aes(x = piece_source, y = value, fill = variable)) +
+  geom_col(position = "dodge") +
+  facet_grid(. ~ patient) +
+  labs(x = "Tumor region", y = "Proportion", fill = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  geom_text(data = unique(filter(cell.type.summary.melt, CellType == "tumor", variable == "UMI proportion")), aes(label = paste0(round(vs.others, 1), "x")), y = 0.85, size = 2.5)
+```
+
+The change in RNA output can also be visualized as a Sankey (or alluvial) plot
+```{r, fig.height=11, fig.width=8, warning=FALSE}
+dat.allu <- reshape2::melt(cell.type.summary, id.vars = c("Patient_piece", "PatientNumber.MS", "piece_source", "CellType", "vs.others"), measure.vars = c("cell_prop", "UMI_prop"))
+
+dat.allu$variable <- factor(dat.allu$variable, labels = c("Cell prop", "UMI prop"))
+tumor.vs <- round(dat.allu[dat.allu$CellType == "tumor" & dat.allu$variable == "Cell prop", "vs.others"], 2)
+
+ggplot(dat.allu, aes(x = variable, y = value, stratum = CellType, alluvium = CellType, fill = CellType, label = CellType)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.1, 0.1)) +
+  geom_flow(decreasing = T) +
+  geom_stratum(alpha = 0.5, decreasing = T) +
+  geom_text(stat = "stratum", size = 3, decreasing = T) +
+  theme_classic() +
+  theme(legend.position = "none", axis.line.x = element_blank(), plot.title = element_text(hjust = 0.5)) +
+  labs(x = NULL, y = "Proportion") +
+  scale_fill_manual(values = celltype_cols) +
+  facet_wrap(PatientNumber.MS ~ piece_source, nrow = 5, ncol = 3)
+```
+
+## Intra-tumor heterogeneity in RNA output
+In the next section of the analysis, we focus only on the tumor cell populations, looking to explore if different tumor cell populations exhibit differences in RNA output.
+
+Perform clustering on the tumor cell data using Seurat scTransform. First we extract the cells of interest (tumor cells)
+```{r}
+tumor.cells <- merge(meta, cell.type.summary) %>% filter(CellType == "tumor", CellFromTumor == "TRUE") # We have fewer tumor cells than the above calc b/c of those within normal samples which we exclude
+
+# Subset only for identified tumor cells
+tumor.lung.counts <- RawDataLung.table.rds[, which(colnames(RawDataLung.table.rds) %in% tumor.cells$cell)]
+
+tumor.lung.counts.meta <- tumor.cells
+rownames(tumor.lung.counts.meta) <- tumor.lung.counts.meta$cell
+```
+
+And then perform normalization and clustering
+```{r, eval=FALSE}
+# Create Seurat object
+lung <- CreateSeuratObject(counts = tumor.lung.counts, meta.data = tumor.lung.counts.meta)
+
+# store mitochondrial percentage in object meta data
+lung <- PercentageFeatureSet(object = lung, pattern = "^MT-", col.name = "percent.mt")
+
+# run sctransform
+lung <- SCTransform(object = lung, vars.to.regress = "percent.mt", verbose = T, return.only.var.genes = FALSE)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+lung <- RunPCA(object = lung, verbose = T)
+
+# Run UMAP
+lung <- RunUMAP(object = lung, dims = 1:30, verbose = T)
+
+lung <- FindNeighbors(object = lung, dims = 1:30, verbose = T)
+lung <- FindClusters(object = lung, verbose = T)
+
+save(lung, file = "data/lung.rda") # save for easy loading
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Load the lung object if it does not exist
+if (!exists("lung")) {
+  message("Quick loading lung seurat data from above chunk")
+  load("data/lung.rda")
+}
+```
+
+```{r, warning=FALSE, message=FALSE, fig.width = 8, fig.height=8}
+# Number of clusters
+n.clust <- length(unique(lung[[]]$seurat_clusters))
+
+# Base UMAP plot
+cluster.umap <- DimPlot(object = lung, label = TRUE, cols = gg_color_hue(n.clust)) + theme(aspect.ratio = 1) + NoLegend() + ggtitle("Generated clusters")
+
+# Get mapping of cluster labels
+cluster.labs <- ggplot_build(cluster.umap)$data[[2]]
+
+# Plot by patient
+patient.umap <- DimPlot(object = lung, group.by = "PatientNumber.MS", label = T) + theme(aspect.ratio = 1) + scale_color_colorblind() + labs(color = "Patient") + NoLegend() + ggtitle("Patient IDs")
+
+# Original NatMed paper's clusters
+orig.cluster.umap <- DimPlot(object = lung, group.by = "cluster", label = F, repel = T) + theme(aspect.ratio = 1) + NoLegend() + ggtitle("NatMed Orig Clusters")
+
+zUMI.plot <- FeaturePlot(object = lung, features = "z_UMI_all", order = T, label = F, pt.size = 0.01) + theme(aspect.ratio = 1) + geom_text(data = cluster.labs, aes(x = x, y = y, label = label)) + scale_color_gradient2(low = "blue", mid = "white", high = "red")
+
+# Plot together
+cluster.umap + patient.umap + orig.cluster.umap + zUMI.plot
+```
+
+zUMIs are not distributed evenly between clusters.
+
+```{r}
+zumi.per.clust <- ggplot(lung[[]], aes(x = seurat_clusters, y = z_UMI_all)) +
+  geom_boxplot(aes(fill = seurat_clusters)) +
+  labs(x = "Seurat cluster") +
+  theme(aspect.ratio = 1) +
+  scale_fill_manual(values = gg_color_hue(n.clust))
+zumi.per.clust
+```
+
+Recreate the alluvial plots this time just with tumor cell clusters.
+```{r, warning=FALSE, message=FALSE, fig.width=8, fig.height=8}
+# Need to load the lung seruat object for the following:
+dat <- lung[[]]
+tumor.dat <- merge(tumor.cells, dat[, c("cell", "seurat_clusters")])
+rm(dat)
+
+# Create piecewise summary
+tumor_piece.summary <- tumor.dat %>%
+  group_by(PatientNumber.MS, Patient_piece, piece_source) %>%
+  summarise(piece_cell_count = n(), piece_umis = sum(n_UMIs), sample_mean_umi = mean(n_UMIs))
+
+# Create seurat cluster type summary
+tumor_clone.type.summary <- filter(tumor.dat) %>%
+  group_by(PatientNumber.MS, Patient_piece, seurat_clusters) %>%
+  summarise(celltype_count = n(), celltype_umis = sum(n_UMIs), celltype_mean_umis = mean(n_UMIs)) %>%
+  data.frame()
+
+# Merge the two
+tumor_cell.type.summary <- merge(tumor_piece.summary, tumor_clone.type.summary, by = c("PatientNumber.MS", "Patient_piece"))
+
+# Compute cell type proportions and umi proportions and mean umis per cell
+tumor_cell.type.summary <- tumor_cell.type.summary %>%
+  mutate(
+    cell_prop = celltype_count / piece_cell_count,
+    UMI_prop = celltype_umis / piece_umis
+  )
+
+# Nice labels
+tumor_cell.type.summary$prop.labs <- paste0(tumor_cell.type.summary$seurat_clusters, " (", (round(tumor_cell.type.summary$cell_prop, digits = 2) * 100), "%)")
+tumor_cell.type.summary$umi.labs <- paste0(tumor_cell.type.summary$seurat_clusters, " (", (round(tumor_cell.type.summary$UMI_prop, digits = 2) * 100), "%)")
+
+# Global amp -- take the average UMIs of the cell type vs the UMIs of all other cell types
+tumor_cell.type.summary$vs.others <- with(tumor_cell.type.summary, (celltype_umis / celltype_count) / ((piece_umis - celltype_umis) / (piece_cell_count - celltype_count)))
+
+# Within population shift (percentage)
+tumor_cell.type.summary$prop_change <- with(tumor_cell.type.summary, UMI_prop / cell_prop)
+
+tumor_cell.type.summary$piece_source <- factor(tumor_cell.type.summary$piece_source, levels = c("core", "middle", "edge"))
+
+# Consistent cell type colorings
+s_cols <- vector(length = length(unique(tumor_cell.type.summary$seurat_clusters)))
+
+gg_color_hue <- function(n) {
+  hues <- seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+s_cols <- gg_color_hue(length(unique(tumor_cell.type.summary$seurat_clusters)))
+names(s_cols) <- as.vector(unique(tumor_cell.type.summary$seurat_clusters))
+
+# Initialize clone plots list to store the results
+clone.plots <- vector(mode = "list")
+# Loop through each piece
+for (i in 1:length(unique(tumor_cell.type.summary$Patient_piece))) {
+  piece <- as.character(unique(tumor_cell.type.summary$Patient_piece))[[i]]
+  piece.lab <- paste0("p_", as.character(unique(tumor_cell.type.summary$Patient_piece))[[i]])
+
+  dat <- filter(tumor_cell.type.summary, Patient_piece == piece)
+
+  # Try with ggalluvial
+  dat.allu <- reshape2::melt(dat, id.vars = c("seurat_clusters", "vs.others"), measure.vars = c("cell_prop", "UMI_prop"))
+
+  dat.allu$variable <- factor(dat.allu$variable, labels = c("Cell prop", "UMI prop"))
+
+  allu.plot <- ggplot(dat.allu, aes(x = variable, y = value, stratum = seurat_clusters, alluvium = seurat_clusters, fill = seurat_clusters, label = seurat_clusters)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_x_discrete(expand = c(0.1, 0.1)) +
+    geom_flow(decreasing = T) +
+    geom_stratum(alpha = 0.5, decreasing = T) +
+    geom_text(stat = "stratum", size = 3, decreasing = T) +
+    theme_classic() +
+    theme(legend.position = "none", axis.line.x = element_blank(), plot.title = element_text(hjust = 0.5)) +
+    labs(x = NULL, y = "Proportion", title = paste0("Piece: ", piece)) +
+    scale_fill_manual(values = s_cols)
+
+  clone.plots[[piece.lab]] <- allu.plot
+}
+
+# Plot results
+aspect <- 2 / 3
+p3 <- with(clone.plots, p_3_core + p_3_middle + p_3_edge) & theme(aspect.ratio = aspect)
+p4 <- with(clone.plots, p_4_core + p_4_middle + p_4_edge) & theme(aspect.ratio = aspect)
+p5 <- with(clone.plots, p_5_core + p_5_middle + p_5_edge) & theme(aspect.ratio = aspect)
+```
+
+Plotting the individual clusters in each tumor piece demonstrates that there exists transcriptionally dominant clones, responsible for proportionally more of the tumor derived RNA than other sub-clones (even when existing as minor populations).
+```{r, warning=FALSE, message=FALSE, fig.width=8, fig.height=8}
+p3 / p4 / p5
+```

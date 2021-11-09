@@ -37,3 +37,15 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# Ignore Rproj file
+*.Rproj
+
+# Ignore renv library
+renv/library
+
+# Ignore R notebook previews
+*.nb.html
+
+# Ignore data folder
+data/
